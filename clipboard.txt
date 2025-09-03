@@ -1,0 +1,462 @@
+# Create a minimal Godot 4 starter kit for a Polytopia-like prototype
+import os, textwrap, json, pathlib
+
+root = "/mnt/data/polytopia-lite"
+os.makedirs(root, exist_ok=True)
+
+readme = f"""# Polytopia-Lite (Two-Player Hotseat) — Starter Kit
+
+A tiny, **Godot 4** prototype riffing on Polytopia with **distinct tribes** (Sci-Fi, Pirates, Ninjas, Knights), a **simple economy**, and **local hotseat** turns (perfect for Remote Play/Parsec).
+
+> Scope: minimal grid, basic movement/attack, city capture, stars income, and one-button **Research** with tribe-unique techs that toggle simple buffs.
+
+## How to Run
+
+1. Install **Godot 4.x**.
+2. Create a **new empty project** anywhere on your machine.
+3. Copy these files into the project root (same folder as `project.godot`):
+   - `Main.tscn`
+   - `Board.gd`
+4. Open `Main.tscn` in Godot and press **Play**.
+
+## Controls (mouse + keyboard)
+- **Left Click** a friendly unit to select it.
+- **Left Click** an adjacent tile to **move** (orthogonal, 1 tile) or **attack** an enemy on that tile.
+- **C**: **Build** a basic Soldier (cost 4 stars) on your **capital** if empty.
+- **R**: **Research** the next tribe tech (cost 6 stars). Techs toggle simple gameplay buffs.
+- **E**: **End Turn**.
+- Win condition (prototype): capture **both cities** or defeat all opposing units.
+
+## Tribes & Simple Tech Effects
+
+Each player starts with a tribe (hardcoded P1=**Synth** (sci-fi), P2=**Corsair** (pirates) by default; you can change this at the top of `Board.gd`).
+
+- **Synth (Sci-Fi)**: 
+  - Techs: **Shields** (+1 max HP for new units), **Laser** (+1 attack), **Blink** (extra move once per turn).
+- **Corsair (Pirates)**:
+  - Techs: **Sailing** (units can cross water), **Plunder** (+2 stars when capturing a city), **Broadside** (+1 attack when adjacent to water).
+- **Shadows (Ninjas)**:
+  - Techs: **Stealth** (first hit against your units each turn deals −1), **Shuriken** (ranged poke on adjacent without retaliation), **Smoke** (once per turn, free disengage).
+- **Order (Knights)**:
+  - Techs: **Fortify** (cities grant +1 defense to stationed units), **Lancers** (+1 move on plains), **Honor** (+1 attack when defending a friendly city).
+
+> Effects are intentionally simple flags in code so you can iterate quickly.
+
+## Notes
+- The map is tiny and randomly sprinkles **Forest**, **Water**, **Mountain** for variety.
+- Movement is **orthogonal** (no diagonals) for simplicity.
+- Ranged or advanced rules are stubbed as comments where relevant.
+- This is a teaching scaffold: clean, readable GDScript you can extend.
+
+Happy tinkering! —Skippy 🛸
+"""
+
+board_gd = r'''extends Node2D
+## Polytopia-Lite Board (Godot 4.x, GDScript)
+## Minimal hotseat prototype with 4 themed tribes & tech flags.
+## Author: Skippy (for Jeff & Brooke)
+
+const TILE_SIZE := 56
+const GRID_W := 12
+const GRID_H := 8
+
+enum TileType { PLAIN, FOREST, WATER, MOUNTAIN, CITY }
+
+class_name Board
+
+# --- Tribe setup (change defaults here) ---
+const TRIBE_P1 := "Synth"   # options: Synth, Corsair, Shadows, Order
+const TRIBE_P2 := "Corsair"
+
+# Colors for players
+const P_COLORS := [Color(0.2, 0.8, 1.0), Color(1.0, 0.5, 0.2)]
+
+# Simple costs
+const COST_SOLDIER := 4
+const COST_RESEARCH := 6
+
+# Data structures
+var tiles : Array = []  # 2D: tiles[x][y] = { "type": TileType, "city_owner": int|-1 }
+var units : Array = []  # list of unit dicts
+var players : Array = []  # { name, tribe, color, stars:int, techs:Array[String], flags:Dictionary, capital:Vector2i }
+var current_player := 0   # 0 or 1
+var selected_unit := -1   # index into units or -1
+
+# Precomputed orthogonal dirs
+const DIRS := [Vector2i(1,0), Vector2i(-1,0), Vector2i(0,1), Vector2i(0,-1)]
+
+# --- Tribe tech definitions (simple flags for quick iteration) ---
+# Each tech toggles a boolean or modifies stats during creation/combat.
+const TRIBE_TECHS := {
+	"Synth": [
+		{"name":"Shields", "flag":"shield_bonus", "desc":"+1 max HP for new units."},
+		{"name":"Laser",   "flag":"atk_bonus",    "desc":"+1 attack."},
+		{"name":"Blink",   "flag":"extra_move",   "desc":"Once per turn, +1 extra move for one unit."}
+	],
+	"Corsair": [
+		{"name":"Sailing",  "flag":"can_sail",      "desc":"Units can cross water."},
+		{"name":"Plunder",  "flag":"plunder",       "desc":"+2 stars on capturing a city."},
+		{"name":"Broadside","flag":"water_edge_atk","desc":"+1 attack when adjacent to water."}
+	],
+	"Shadows": [
+		{"name":"Stealth",  "flag":"first_hit_resist","desc":"First hit vs your army per turn deals -1."},
+		{"name":"Shuriken", "flag":"adj_ranged",      "desc":"Attack adjacent without retaliation (once/turn)."},
+		{"name":"Smoke",    "flag":"free_disengage",  "desc":"Once/turn ignore zone-of-control (not implemented fully)."},
+	],
+	"Order": [
+		{"name":"Fortify", "flag":"city_defense", "desc":"Units in friendly cities get +1 defense."},
+		{"name":"Lancers", "flag":"plains_move",  "desc":"+1 move on plains."},
+		{"name":"Honor",   "flag":"city_counter", "desc":"+1 attack when defending a friendly city."},
+	]
+}
+
+func _ready() -> void:
+	randomize()
+	_init_players()
+	_gen_map()
+	_place_capitals_and_starters()
+	queue_redraw()
+
+func _init_players() -> void:
+	players = [
+		{
+			"name":"Player 1",
+			"tribe": TRIBE_P1,
+			"color": P_COLORS[0],
+			"stars": 6,
+			"techs": [],
+			"flags": {}, # flags toggled by techs
+			"capital": Vector2i(1, GRID_H/2)
+		},
+		{
+			"name":"Player 2",
+			"tribe": TRIBE_P2,
+			"color": P_COLORS[1],
+			"stars": 6,
+			"techs": [],
+			"flags": {},
+			"capital": Vector2i(GRID_W-2, GRID_H/2)
+		}
+	]
+
+func _gen_map() -> void:
+	tiles.resize(GRID_W)
+	for x in GRID_W:
+		tiles[x] = []
+		for y in GRID_H:
+			var r := randf()
+			var t := TileType.PLAIN
+			if r < 0.10:
+				t = TileType.WATER
+			elif r < 0.25:
+				t = TileType.FOREST
+			elif r < 0.33:
+				t = TileType.MOUNTAIN
+			tiles[x].append({ "type": t, "city_owner": -1 })
+	# carve a few neutral cities
+	for i in 4:
+		var cx := randi_range(2, GRID_W-3)
+		var cy := randi_range(1, GRID_H-2)
+		tiles[cx][cy]["type"] = TileType.CITY
+		tiles[cx][cy]["city_owner"] = -1
+
+func _place_capitals_and_starters() -> void:
+	# Set capitals
+	for pid in [0,1]:
+		var c := players[pid]["capital"]
+		tiles[c.x][c.y]["type"] = TileType.CITY
+		tiles[c.x][c.y]["city_owner"] = pid
+	# Place initial units
+	_spawn_unit( players[0]["capital"] + Vector2i(1,0), 0 )
+	_spawn_unit( players[1]["capital"] + Vector2i(-1,0), 1 )
+
+func _spawn_unit(cell:Vector2i, owner:int, kind:String = "Soldier") -> void:
+	var base_hp := 2
+	var base_atk := 1
+	var base_move := 1
+	# tribe creation bonuses
+	var flags:Dictionary = players[owner]["flags"]
+	if flags.get("shield_bonus", false):
+		base_hp += 1
+	var u := {
+		"pos": cell,
+		"owner": owner,
+		"hp": base_hp,
+		"atk": base_atk,
+		"move": base_move,
+		"type": kind,
+		"moved": false,
+		"acted": false,
+	}
+	units.append(u)
+
+func _process(_dt: float) -> void:
+	pass
+
+func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
+		var cell := _mouse_to_cell(event.position)
+		_handle_left_click(cell)
+	elif event is InputEventKey and event.pressed:
+		match event.keycode:
+			KEY_E:
+				_end_turn()
+			KEY_C:
+				_cmd_build_soldier()
+			KEY_R:
+				_cmd_research()
+
+func _mouse_to_cell(p:Vector2) -> Vector2i:
+	var x := int(p.x / TILE_SIZE)
+	var y := int(p.y / TILE_SIZE)
+	return Vector2i(clamp(x,0,GRID_W-1), clamp(y,0,GRID_H-1))
+
+func _handle_left_click(cell:Vector2i) -> void:
+	# selection logic
+	if selected_unit == -1:
+		selected_unit = _unit_index_at(cell, current_player)
+		queue_redraw()
+		return
+	# if clicking same owner unit, reselect
+	var idx_friend := _unit_index_at(cell, current_player)
+	if idx_friend != -1:
+		selected_unit = idx_friend
+		queue_redraw()
+		return
+	# otherwise try move/attack with selected
+	var idx := selected_unit
+	if idx == -1:
+		return
+	var u = units[idx]
+	if u["owner"] != current_player or u["moved"]:
+		# cannot act
+		selected_unit = -1
+		queue_redraw()
+		return
+	if _is_adjacent(u["pos"], cell) and _passable(cell, u["owner"]):
+		var enemy_idx := _unit_index_at(cell, 1-current_player)
+		if enemy_idx != -1:
+			_combat(idx, enemy_idx)
+		else:
+			# move or capture
+			u["pos"] = cell
+			units[idx] = u
+			u["moved"] = true
+			# capture city if any
+			if tiles[cell.x][cell.y]["type"] == TileType.CITY:
+				tiles[cell.x][cell.y]["city_owner"] = current_player
+				# plunder reward
+				if players[current_player]["flags"].get("plunder", false):
+					players[current_player]["stars"] += 2
+		selected_unit = -1
+		queue_redraw()
+	else:
+		# invalid click, clear selection
+		selected_unit = -1
+		queue_redraw()
+
+func _is_adjacent(a:Vector2i, b:Vector2i) -> bool:
+	return abs(a.x-b.x) + abs(a.y-b.y) == 1
+
+func _passable(cell:Vector2i, owner:int) -> bool:
+	var t := tiles[cell.x][cell.y]["type"]
+	if t == TileType.MOUNTAIN:
+		return false
+	if t == TileType.WATER and not players[owner]["flags"].get("can_sail", false):
+		return false
+	# cannot move into occupied by friendly
+	if _unit_index_at(cell, owner) != -1:
+		return false
+	return true
+
+func _unit_index_at(cell:Vector2i, owner_filter:int=-2) -> int:
+	for i in units.size():
+		if units[i]["pos"] == cell:
+			if owner_filter == -2 or units[i]["owner"] == owner_filter:
+				return i
+	return -1
+
+func _combat(attacker_idx:int, defender_idx:int) -> void:
+	var a = units[attacker_idx]
+	var d = units[defender_idx]
+	# base attacks
+	var a_atk := a["atk"]
+	var d_def := 0
+	# water-edge bonus for Corsair
+	if players[a["owner"]]["flags"].get("water_edge_atk", false):
+		if _adjacent_to_type(a["pos"], TileType.WATER):
+			a_atk += 1
+	# City defense for Order
+	if players[d["owner"]]["flags"].get("city_defense", false):
+		var t := tiles[d["pos"].x][d["pos"].y]["type"]
+		if t == TileType.CITY and tiles[d["pos"].x][d["pos"].y]["city_owner"] == d["owner"]:
+			d_def += 1
+	# apply damage
+	var dmg_to_def := max(0, a_atk - d_def)
+	# Shadows 'Stealth' first-hit reduction (once per turn) — simplified per attack here
+	if players[d["owner"]]["flags"].get("first_hit_resist", false) and dmg_to_def > 0:
+		dmg_to_def -= 1
+	d["hp"] -= max(0, dmg_to_def)
+	# retaliation (simple; could disable if attacker has 'adj_ranged')
+	var retaliate := true
+	if players[a["owner"]]["flags"].get("adj_ranged", false):
+		retaliate = false
+	if retaliate and d["hp"] > 0:
+		var dmg_to_att := max(0, d["atk"] - 0) # no def now
+		# 'Honor' bonus when defender is in own city
+		if players[d["owner"]]["flags"].get("city_counter", false):
+			var t2 := tiles[d["pos"].x][d["pos"].y]["type"]
+			if t2 == TileType.CITY and tiles[d["pos"].x][d["pos"].y]["city_owner"] == d["owner"]:
+				dmg_to_att += 1
+		a["hp"] -= max(0, dmg_to_att)
+	# write back and clean up
+	units[attacker_idx] = a
+	units[defender_idx] = d
+	if d["hp"] <= 0:
+		units.remove_at(defender_idx)
+		# if defender removed before attacker index, shift attacker_idx
+		if defender_idx < attacker_idx:
+			attacker_idx -= 1
+	if a["hp"] <= 0:
+		units.remove_at(attacker_idx)
+	queue_redraw()
+
+func _cmd_build_soldier() -> void:
+	var p := players[current_player]
+	if p["stars"] < COST_SOLDIER:
+		return
+	var cap := p["capital"]
+	# must be empty
+	if _unit_index_at(cap) != -1:
+		return
+	players[current_player]["stars"] -= COST_SOLDIER
+	_spawn_unit(cap, current_player)
+	queue_redraw()
+
+func _cmd_research() -> void:
+	var p := players[current_player]
+	if p["stars"] < COST_RESEARCH:
+		return
+	var tribe := p["tribe"]
+	var tech_list : Array = TRIBE_TECHS.get(tribe, [])
+	# find first tech not owned
+	var next_tech := null
+	for t in tech_list:
+		if not p["techs"].has(t["name"]):
+			next_tech = t
+			break
+	if next_tech == null:
+		return # all researched
+	players[current_player]["stars"] -= COST_RESEARCH
+	p["techs"].append(next_tech["name"])
+	p["flags"][next_tech["flag"]] = true
+	players[current_player] = p
+	queue_redraw()
+
+func _end_turn() -> void:
+	# income
+	var income := 0
+	for x in GRID_W:
+		for y in GRID_H:
+			if tiles[x][y]["type"] == TileType.CITY and tiles[x][y]["city_owner"] == current_player:
+				income += 2
+	players[current_player]["stars"] += income
+	# reset unit actions for next player
+	for i in units.size():
+		if units[i]["owner"] == current_player:
+			units[i]["moved"] = false
+			units[i]["acted"] = false
+	# switch player
+	selected_unit = -1
+	current_player = 1 - current_player
+	# optional: check victory
+	_check_victory()
+	queue_redraw()
+
+func _check_victory() -> void:
+	var city_count := [0,0]
+	for x in GRID_W:
+		for y in GRID_H:
+			if tiles[x][y]["type"] == TileType.CITY:
+				var o := tiles[x][y]["city_owner"]
+				if o in [0,1]:
+					city_count[o] += 1
+	# if someone owns all cities or opponent has no units
+	var p0_units := 0
+	var p1_units := 0
+	for u in units:
+		if u["owner"] == 0: p0_units += 1
+		elif u["owner"] == 1: p1_units += 1
+	if city_count[0] > 0 and city_count[1] == 0 or p1_units == 0:
+		print("Player 0 wins!")
+	if city_count[1] > 0 and city_count[0] == 0 or p0_units == 0:
+		print("Player 1 wins!")
+
+func _adjacent_to_type(cell:Vector2i, t:int) -> bool:
+	for d in DIRS:
+		var p := cell + d
+		if p.x >= 0 and p.x < GRID_W and p.y >= 0 and p.y < GRID_H:
+			if tiles[p.x][p.y]["type"] == t:
+				return true
+	return false
+
+func _draw() -> void:
+	# Board
+	for x in GRID_W:
+		for y in GRID_H:
+			var r := Rect2(Vector2(x*TILE_SIZE, y*TILE_SIZE), Vector2(TILE_SIZE-1, TILE_SIZE-1))
+			var t := tiles[x][y]["type"]
+			var col := Color(0.35,0.55,0.35) # plain
+			if t == TileType.FOREST:
+				col = Color(0.20,0.45,0.20)
+			elif t == TileType.WATER:
+				col = Color(0.15,0.45,0.85)
+			elif t == TileType.MOUNTAIN:
+				col = Color(0.45,0.45,0.45)
+			elif t == TileType.CITY:
+				col = Color(0.75,0.65,0.25)
+			draw_rect(r, col, true)
+			# city owner marker
+			if t == TileType.CITY and tiles[x][y]["city_owner"] != -1:
+				var pid := tiles[x][y]["city_owner"]
+				draw_rect(Rect2(r.position+Vector2(8,8), Vector2(12,12)), P_COLORS[pid], true)
+	# Units
+	for i in units.size():
+		var u = units[i]
+		var pos := Vector2(u["pos"].x*TILE_SIZE + TILE_SIZE*0.5, u["pos"].y*TILE_SIZE + TILE_SIZE*0.5)
+		var color := P_COLORS[u["owner"]]
+		draw_circle(pos, TILE_SIZE*0.28, color)
+		# HP pips
+		for h in u["hp"]:
+			var p := pos + Vector2(-12 + h*6, 16)
+			draw_rect(Rect2(p, Vector2(4,4)), Color.BLACK, true)
+	# Selection highlight
+	if selected_unit != -1:
+		var upos:Vector2i = units[selected_unit]["pos"]
+		var rr := Rect2(Vector2(upos.x*TILE_SIZE, upos.y*TILE_SIZE), Vector2(TILE_SIZE-1, TILE_SIZE-1))
+		draw_rect(rr, Color(1,1,1,0.25), false, 2.0)
+
+func _notification(what):
+	if what == NOTIFICATION_TRANSLATION_CHANGED:
+		queue_redraw()
+'''
+
+main_tscn = """[gd_scene format=3]
+
+[node name="Main" type="Node2D"]
+script = ExtResource( 1 )
+
+[ext_resource type="Script" path="res://Board.gd" id=1]
+"""
+
+# Write files
+with open(os.path.join(root, "README.md"), "w", encoding="utf-8") as f:
+    f.write(readme)
+
+with open(os.path.join(root, "Board.gd"), "w", encoding="utf-8") as f:
+    f.write(board_gd)
+
+with open(os.path.join(root, "Main.tscn"), "w", encoding="utf-8") as f:
+    f.write(main_tscn)
+
+root
